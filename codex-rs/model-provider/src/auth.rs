@@ -237,6 +237,10 @@ pub(crate) async fn resolve_provider_auth_for_scope(
     // custom-provider session would otherwise depend on ChatGPT credentials it
     // does not have. Ambient agent identity is also dropped here so first-party
     // identity material is never sent to a third-party endpoint.
+    //
+    // The requested `AgentIdentityAuthPolicy` is intentionally ignored: agent
+    // assertions are only accepted by the first-party Codex backend, so honoring
+    // the policy here could only produce credentials the provider cannot use.
     if !provider.requires_openai_auth {
         let auth = auth.filter(|auth| !matches!(auth, CodexAuth::AgentIdentity(_)));
         return resolve_provider_auth(auth, provider).map(ResolvedProviderAuth::new);
