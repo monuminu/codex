@@ -250,8 +250,11 @@ pub(crate) async fn resolve_provider_auth_for_scope(
     // Providers that carry their own credentials never need first-party Codex
     // auth, so they must not take the ChatGPT agent-identity bootstrap path.
     // Otherwise an Azure-only or other custom-provider session would depend on
-    // ChatGPT credentials it does not have.
-    if let Some(provider_auth) = provider_supplied_auth(provider)? {
+    // ChatGPT credentials it does not have. First-party providers keep their
+    // existing precedence, where agent identity wins over a configured key.
+    if !provider.requires_openai_auth
+        && let Some(provider_auth) = provider_supplied_auth(provider)?
+    {
         return Ok(ResolvedProviderAuth::new(provider_auth));
     }
 
@@ -942,6 +945,43 @@ mod tests {
         assert_eq!(provider_auth.agent_identity_telemetry, None);
         assert!(!fallback.is_engaged());
         assert_eq!(registration_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn first_party_provider_keeps_agent_identity_over_provider_bearer() {
+        let auth = CodexAuth::AgentIdentity(
+            agent_identity_auth(/*chatgpt_account_is_fedramp*/ false).await,
+        );
+        let mut provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+        provider.experimental_bearer_token = Some("first-party-token".into());
+
+        let provider_auth = resolve_provider_auth_for_scope(
+            /*auth_manager*/ None,
+            Some(&auth),
+            &provider,
+            provider_auth_scope(
+                AgentIdentityAuthPolicy::JwtOnly,
+                AgentIdentitySessionFallback::default(),
+            ),
+        )
+        .await
+        .expect("auth should resolve");
+
+        assert_eq!(
+            provider_auth.agent_identity_telemetry,
+            Some(AgentIdentityTelemetry {
+                agent_id: "agent-runtime-1".to_string(),
+                task_id: "task-run-1".to_string(),
+            })
+        );
+        assert!(
+            provider_auth
+                .auth
+                .to_auth_headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("AgentAssertion "))
+        );
     }
 
     #[tokio::test]
