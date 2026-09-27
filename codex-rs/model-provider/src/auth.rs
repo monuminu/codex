@@ -194,16 +194,31 @@ pub(crate) fn auth_manager_for_provider(
     }
 }
 
+/// Auth the provider supplies on its own, independent of any first-party Codex
+/// login: an explicit or command-backed bearer token, or a provider that is
+/// meant to send no auth headers at all.
+///
+/// When this resolves, the request never depends on ChatGPT credentials.
+fn provider_supplied_auth(
+    provider: &ModelProviderInfo,
+) -> codex_protocol::error::Result<Option<SharedAuthProvider>> {
+    if let Some(auth) = bearer_auth_for_provider(provider)? {
+        return Ok(Some(Arc::new(auth)));
+    }
+
+    if !provider.requires_openai_auth && provider.auth.is_none() {
+        return Ok(Some(unauthenticated_auth_provider()));
+    }
+
+    Ok(None)
+}
+
 pub(crate) fn resolve_provider_auth(
     auth: Option<&CodexAuth>,
     provider: &ModelProviderInfo,
 ) -> codex_protocol::error::Result<SharedAuthProvider> {
-    if let Some(auth) = bearer_auth_for_provider(provider)? {
-        return Ok(Arc::new(auth));
-    }
-
-    if !provider.requires_openai_auth && provider.auth.is_none() {
-        return Ok(unauthenticated_auth_provider());
+    if let Some(provider_auth) = provider_supplied_auth(provider)? {
+        return Ok(provider_auth);
     }
 
     if matches!(
@@ -232,6 +247,14 @@ pub(crate) async fn resolve_provider_auth_for_scope(
         session_source,
         agent_identity_session_fallback,
     } = scope;
+    // Providers that carry their own credentials never need first-party Codex
+    // auth, so they must not take the ChatGPT agent-identity bootstrap path.
+    // Otherwise an Azure-only or other custom-provider session would depend on
+    // ChatGPT credentials it does not have.
+    if let Some(provider_auth) = provider_supplied_auth(provider)? {
+        return Ok(ResolvedProviderAuth::new(provider_auth));
+    }
+
     if let Some(CodexAuth::AgentIdentity(agent_identity_auth)) = auth {
         return Ok(ResolvedProviderAuth::for_agent_identity(
             agent_identity_auth.clone(),
@@ -850,5 +873,98 @@ mod tests {
         assert!(first_fallback.is_engaged());
         assert!(second_fallback.is_engaged());
         assert_eq!(registration_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn provider_supplied_bearer_skips_chatgpt_agent_identity_bootstrap() {
+        let server = MockServer::start().await;
+        let registration_count = Arc::new(AtomicUsize::new(0));
+        mount_transient_agent_registration(
+            &server,
+            /*status*/ 503,
+            Arc::clone(&registration_count),
+        )
+        .await;
+        let (_codex_home, auth_manager, auth) = chatgpt_auth_manager(server.uri()).await;
+        let mut provider = create_oss_provider_with_base_url(
+            "https://example.openai.azure.com",
+            WireApi::Responses,
+        );
+        provider.name = "Azure".to_string();
+        provider.experimental_bearer_token = Some("azure-token".into());
+        let fallback = AgentIdentitySessionFallback::default();
+
+        let provider_auth = resolve_provider_auth_for_scope(
+            Some(auth_manager),
+            Some(&auth),
+            &provider,
+            provider_auth_scope(AgentIdentityAuthPolicy::ChatGptAuth, fallback.clone()),
+        )
+        .await
+        .expect("provider bearer auth should resolve");
+
+        let mut expected = HeaderMap::new();
+        expected.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer azure-token"),
+        );
+        assert_eq!(provider_auth.auth.to_auth_headers(), expected);
+        assert_eq!(provider_auth.agent_identity_telemetry, None);
+        assert!(!fallback.is_engaged());
+        assert_eq!(registration_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_provider_skips_chatgpt_agent_identity_bootstrap() {
+        let server = MockServer::start().await;
+        let registration_count = Arc::new(AtomicUsize::new(0));
+        mount_transient_agent_registration(
+            &server,
+            /*status*/ 503,
+            Arc::clone(&registration_count),
+        )
+        .await;
+        let (_codex_home, auth_manager, auth) = chatgpt_auth_manager(server.uri()).await;
+        let provider =
+            create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses);
+        let fallback = AgentIdentitySessionFallback::default();
+
+        let provider_auth = resolve_provider_auth_for_scope(
+            Some(auth_manager),
+            Some(&auth),
+            &provider,
+            provider_auth_scope(AgentIdentityAuthPolicy::ChatGptAuth, fallback.clone()),
+        )
+        .await
+        .expect("unauthenticated provider auth should resolve");
+
+        assert_eq!(provider_auth.auth.to_auth_headers(), HeaderMap::new());
+        assert_eq!(provider_auth.agent_identity_telemetry, None);
+        assert!(!fallback.is_engaged());
+        assert_eq!(registration_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn custom_provider_does_not_inherit_ambient_agent_identity_auth() {
+        let auth = CodexAuth::AgentIdentity(
+            agent_identity_auth(/*chatgpt_account_is_fedramp*/ false).await,
+        );
+        let provider =
+            create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses);
+
+        let provider_auth = resolve_provider_auth_for_scope(
+            /*auth_manager*/ None,
+            Some(&auth),
+            &provider,
+            provider_auth_scope(
+                AgentIdentityAuthPolicy::JwtOnly,
+                AgentIdentitySessionFallback::default(),
+            ),
+        )
+        .await
+        .expect("auth should resolve");
+
+        assert_eq!(provider_auth.auth.to_auth_headers(), HeaderMap::new());
+        assert_eq!(provider_auth.agent_identity_telemetry, None);
     }
 }
