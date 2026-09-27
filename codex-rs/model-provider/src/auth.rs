@@ -194,31 +194,16 @@ pub(crate) fn auth_manager_for_provider(
     }
 }
 
-/// Auth the provider supplies on its own, independent of any first-party Codex
-/// login: an explicit or command-backed bearer token, or a provider that is
-/// meant to send no auth headers at all.
-///
-/// When this resolves, the request never depends on ChatGPT credentials.
-fn provider_supplied_auth(
-    provider: &ModelProviderInfo,
-) -> codex_protocol::error::Result<Option<SharedAuthProvider>> {
-    if let Some(auth) = bearer_auth_for_provider(provider)? {
-        return Ok(Some(Arc::new(auth)));
-    }
-
-    if !provider.requires_openai_auth && provider.auth.is_none() {
-        return Ok(Some(unauthenticated_auth_provider()));
-    }
-
-    Ok(None)
-}
-
 pub(crate) fn resolve_provider_auth(
     auth: Option<&CodexAuth>,
     provider: &ModelProviderInfo,
 ) -> codex_protocol::error::Result<SharedAuthProvider> {
-    if let Some(provider_auth) = provider_supplied_auth(provider)? {
-        return Ok(provider_auth);
+    if let Some(auth) = bearer_auth_for_provider(provider)? {
+        return Ok(Arc::new(auth));
+    }
+
+    if !provider.requires_openai_auth && provider.auth.is_none() {
+        return Ok(unauthenticated_auth_provider());
     }
 
     if matches!(
@@ -247,15 +232,14 @@ pub(crate) async fn resolve_provider_auth_for_scope(
         session_source,
         agent_identity_session_fallback,
     } = scope;
-    // Providers that carry their own credentials never need first-party Codex
-    // auth, so they must not take the ChatGPT agent-identity bootstrap path.
-    // Otherwise an Azure-only or other custom-provider session would depend on
-    // ChatGPT credentials it does not have. First-party providers keep their
-    // existing precedence, where agent identity wins over a configured key.
-    if !provider.requires_openai_auth
-        && let Some(provider_auth) = provider_supplied_auth(provider)?
-    {
-        return Ok(ResolvedProviderAuth::new(provider_auth));
+    // Providers that are not first-party carry their own credentials, so they
+    // must never take the ChatGPT agent-identity path: an Azure-only or other
+    // custom-provider session would otherwise depend on ChatGPT credentials it
+    // does not have. Ambient agent identity is also dropped here so first-party
+    // identity material is never sent to a third-party endpoint.
+    if !provider.requires_openai_auth {
+        let auth = auth.filter(|auth| !matches!(auth, CodexAuth::AgentIdentity(_)));
+        return resolve_provider_auth(auth, provider).map(ResolvedProviderAuth::new);
     }
 
     if let Some(CodexAuth::AgentIdentity(agent_identity_auth)) = auth {
@@ -945,6 +929,40 @@ mod tests {
         assert_eq!(provider_auth.agent_identity_telemetry, None);
         assert!(!fallback.is_engaged());
         assert_eq!(registration_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn command_auth_provider_does_not_inherit_ambient_agent_identity_auth() {
+        let auth = CodexAuth::AgentIdentity(
+            agent_identity_auth(/*chatgpt_account_is_fedramp*/ false).await,
+        );
+        let mut provider =
+            create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses);
+        provider.auth = Some(ModelProviderAuthInfo {
+            command: "print-token".to_string(),
+            args: Vec::new(),
+            timeout_ms: NonZeroU64::new(5_000).expect("timeout should be non-zero"),
+            refresh_interval_ms: 300_000,
+            cwd: std::env::current_dir()
+                .expect("current directory should be available")
+                .try_into()
+                .expect("current directory should be absolute"),
+        });
+
+        let provider_auth = resolve_provider_auth_for_scope(
+            /*auth_manager*/ None,
+            Some(&auth),
+            &provider,
+            provider_auth_scope(
+                AgentIdentityAuthPolicy::JwtOnly,
+                AgentIdentitySessionFallback::default(),
+            ),
+        )
+        .await
+        .expect("auth should resolve");
+
+        assert_eq!(provider_auth.auth.to_auth_headers(), HeaderMap::new());
+        assert_eq!(provider_auth.agent_identity_telemetry, None);
     }
 
     #[tokio::test]
